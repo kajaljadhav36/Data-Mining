@@ -1,4 +1,3 @@
-'''
 import os
 import logging
 import argparse
@@ -19,455 +18,203 @@ logging.basicConfig(
     datefmt="%m/%d/%Y %H:%M:%S",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log_manager = logging.getLogger(__name__)
 
-# Processor Classes
-class InputExample:
-    def __init__(self, guid, text_a, text_b=None, label=None):
-        self.guid = guid
-        self.text_a = text_a
-        self.text_b = text_b
-        self.label = label
+# Data Classes
+class DataSample:
+    def __init__(self, identifier, primary_text, secondary_text=None, target_label=None):
+        self.identifier = identifier
+        self.primary_text = primary_text
+        self.secondary_text = secondary_text
+        self.target_label = target_label
 
-class InputFeatures:
-    def __init__(self, input_ids, attention_mask, label_id):
-        self.input_ids = input_ids
+class DataFeatures:
+    def __init__(self, token_ids, attention_mask, label_index):
+        self.token_ids = token_ids
         self.attention_mask = attention_mask
-        self.label_id = label_id
+        self.label_index = label_index
 
-class DataProcessor:
+class DatasetProcessor:
     @classmethod
-    def _read_csv(cls, input_file):
-        file = pd.read_csv(input_file)
-        required_columns = ["ID", "TEXT", "Label"]
-        if not all(col in file.columns for col in required_columns):
-            raise ValueError(f"The CSV file {input_file} must contain the following columns: {required_columns}")
-        return zip(file.ID, file.TEXT, file.Label)
+    def read_csv_file(cls, file_path):
+        data_frame = pd.read_csv(file_path)
+        expected_columns = ["ID", "TEXT", "Label"]
+        if not all(column in data_frame.columns for column in expected_columns):
+            raise ValueError(f"The CSV file {file_path} must contain these columns: {expected_columns}")
+        return zip(data_frame.ID, data_frame.TEXT, data_frame.Label)
 
-class ReadmissionProcessor(DataProcessor):
-    def get_train_examples(self, data_dir):
-        logger.info(f"LOOKING AT {os.path.join(data_dir, 'train.csv')}")
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.csv")), "train")
+class AdmissionProcessor(DatasetProcessor):
+    def load_training_data(self, directory_path):
+        log_manager.info(f"Reading training data from {os.path.join(directory_path, 'train.csv')}")
+        return self.create_samples(self.read_csv_file(os.path.join(directory_path, "train.csv")), "train")
 
-    def get_eval_examples(self, data_dir):
-        logger.info(f"LOOKING AT {os.path.join(data_dir, 'val.csv')}")
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "val.csv")), "eval")
+    def load_validation_data(self, directory_path):
+        log_manager.info(f"Reading validation data from {os.path.join(directory_path, 'val.csv')}")
+        return self.create_samples(self.read_csv_file(os.path.join(directory_path, "val.csv")), "validation")
 
-    def get_test_examples(self, data_dir):
-        logger.info(f"LOOKING AT {os.path.join(data_dir, 'test.csv')}")
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.csv")), "test")
+    def load_test_data(self, directory_path):
+        log_manager.info(f"Reading test data from {os.path.join(directory_path, 'test.csv')}")
+        return self.create_samples(self.read_csv_file(os.path.join(directory_path, "test.csv")), "test")
 
-    def get_labels(self):
+    def get_class_labels(self):
         return ["0", "1"]
 
-    def _create_examples(self, lines, set_type):
-        examples = []
-        for i, line in enumerate(lines):
-            guid = f"{set_type}-{i}"
-            text_a = line[1]
-            label = int(line[2])
-            examples.append(InputExample(guid=guid, text_a=text_a, label=label))
-        return examples
+    def create_samples(self, data_lines, dataset_type):
+        samples = []
+        for index, line in enumerate(data_lines):
+            identifier = f"{dataset_type}-{index}"
+            primary_text = line[1]
+            target_label = int(line[2])
+            samples.append(DataSample(identifier=identifier, primary_text=primary_text, target_label=target_label))
+        return samples
 
-# Convert Examples to Features
-def convert_examples_to_features(examples, tokenizer, max_seq_length):
-    features = []
-    for example in examples:
-        inputs = tokenizer(
-            example.text_a,
+# Convert Samples to Features
+def convert_samples_to_features(samples, tokenizer, max_length):
+    feature_list = []
+    for sample in samples:
+        encoded_data = tokenizer(
+            sample.primary_text,
             padding="max_length",
             truncation=True,
-            max_length=max_seq_length,
+            max_length=max_length,
             return_tensors="pt",
         )
-        input_ids = inputs["input_ids"].squeeze(0)
-        attention_mask = inputs["attention_mask"].squeeze(0)
-        label_id = int(example.label)
+        token_ids = encoded_data["input_ids"].squeeze(0)
+        attention_mask = encoded_data["attention_mask"].squeeze(0)
+        label_index = int(sample.target_label)
 
-        features.append(InputFeatures(input_ids=input_ids, attention_mask=attention_mask, label_id=label_id))
-    return features
+        feature_list.append(DataFeatures(token_ids=token_ids, attention_mask=attention_mask, label_index=label_index))
+    return feature_list
 
-# Evaluate Model and Plot ROC AUC
-def evaluate_and_plot_roc(model, dataloader, device, output_path):
+# Evaluate and Generate ROC AUC
+def generate_roc_curve_and_metrics(model, data_loader, device, output_file):
     model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
+    predictions = []
+    actual_labels = []
+    probabilities = []
 
     with torch.no_grad():
-        for batch in dataloader:
-            input_ids, attention_mask, labels = [b.to(device) for b in batch]
+        for data_batch in data_loader:
+            token_ids, masks, true_labels = [data.to(device) for data in data_batch]
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=1)[:, 1]  # Positive class probability
+            model_outputs = model(input_ids=token_ids, attention_mask=masks)
+            prediction_scores = model_outputs.logits
+            positive_probs = torch.softmax(prediction_scores, dim=1)[:, 1]
 
-            preds = torch.argmax(logits, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            batch_predictions = torch.argmax(prediction_scores, dim=1)
+            predictions.extend(batch_predictions.cpu().numpy())
+            actual_labels.extend(true_labels.cpu().numpy())
+            probabilities.extend(positive_probs.cpu().numpy())
 
-    # ROC Curve
-    fpr, tpr, _ = roc_curve(all_labels, all_probs)
-    roc_auc = auc(fpr, tpr)
+    # Calculate ROC Curve
+    false_positive_rate, true_positive_rate, _ = roc_curve(actual_labels, probabilities)
+    roc_auc_value = auc(false_positive_rate, true_positive_rate)
 
     # Plot ROC Curve
     plt.figure()
-    plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {roc_auc:.2f})")
-    plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--", label="Chance")
+    plt.plot(false_positive_rate, true_positive_rate, color="orange", lw=2, label=f"ROC Curve (AUC = {roc_auc_value:.2f})")
+    plt.plot([0, 1], [0, 1], color="blue", lw=2, linestyle="--", label="Baseline")
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title("Receiver Operating Characteristic (ROC)")
+    plt.title("ROC Curve Analysis")
     plt.legend(loc="lower right")
-    plt.grid(True)
-    plt.savefig(output_path)
+    plt.grid()
+    plt.savefig(output_file)
     plt.close()
 
-    return roc_auc
+    # Generate Classification Metrics
+    classification_metrics = classification_report(actual_labels, predictions, target_names=["Class 0", "Class 1"])
+    accuracy_score = np.mean(np.array(predictions) == np.array(actual_labels))
+
+    return roc_auc_value, classification_metrics, accuracy_score
 
 # Main Function
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", required=True)
-    parser.add_argument("--bert_model", default="emilyalsentzer/Bio_ClinicalBERT", required=False)
-    parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--max_seq_length", default=256, type=int)
-    parser.add_argument("--train_batch_size", default=16, type=int)
+    parser.add_argument("--data_directory", required=True)
+    parser.add_argument("--pretrained_model", default="emilyalsentzer/Bio_ClinicalBERT")
+    parser.add_argument("--output_directory", required=True)
+    parser.add_argument("--max_token_length", default=256, type=int)
+    parser.add_argument("--batch_size", default=16, type=int)
     parser.add_argument("--learning_rate", default=1e-5, type=float)
-    parser.add_argument("--num_train_epochs", default=10, type=int)
-    parser.add_argument("--do_train", action="store_true")
-    parser.add_argument("--do_eval", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--training_epochs", default=10, type=int)
+    parser.add_argument("--train_model", action="store_true")
+    parser.add_argument("--evaluate_model", action="store_true")
+    arguments = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
+    log_manager.info(f"Using device: {device}")
 
+    # Set Random Seeds
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
     if device == "cuda":
         torch.cuda.manual_seed_all(42)
 
-    processor = ReadmissionProcessor()
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model)
-    model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels=2)
+    processor = AdmissionProcessor()
+    tokenizer = BertTokenizer.from_pretrained(arguments.pretrained_model)
+    model = BertForSequenceClassification.from_pretrained(arguments.pretrained_model, num_labels=2)
     model.to(device)
 
-    if args.do_train:
-        train_examples = processor.get_train_examples(args.data_dir)
-        train_features = convert_examples_to_features(train_examples, tokenizer, args.max_seq_length)
+    # Training Phase
+    if arguments.train_model:
+        training_samples = processor.load_training_data(arguments.data_directory)
+        training_features = convert_samples_to_features(training_samples, tokenizer, arguments.max_token_length)
 
-        train_data = TensorDataset(
-            torch.stack([f.input_ids for f in train_features]),
-            torch.stack([f.attention_mask for f in train_features]),
-            torch.tensor([f.label_id for f in train_features], dtype=torch.long),
+        train_dataset = TensorDataset(
+            torch.stack([feature.token_ids for feature in training_features]),
+            torch.stack([feature.attention_mask for feature in training_features]),
+            torch.tensor([feature.label_index for feature in training_features], dtype=torch.long),
         )
-        train_sampler = RandomSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
+        train_loader = DataLoader(train_dataset, sampler=RandomSampler(train_dataset), batch_size=arguments.batch_size)
 
-        optimizer = AdamW(model.parameters(), lr=args.learning_rate)
-        num_training_steps = len(train_dataloader) * args.num_train_epochs
-        scheduler = get_scheduler(
-            "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
+        optimizer = AdamW(model.parameters(), lr=arguments.learning_rate)
+        total_training_steps = len(train_loader) * arguments.training_epochs
+        learning_scheduler = get_scheduler(
+            "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=total_training_steps
         )
 
         model.train()
-        for epoch in trange(args.num_train_epochs, desc="Epoch"):
-            total_loss = 0
-            for batch in train_dataloader:
-                batch = tuple(t.to(device) for t in batch)
-                input_ids, attention_mask, labels = batch
+        for epoch in trange(arguments.training_epochs, desc="Training Epochs"):
+            epoch_loss = 0
+            for data_batch in train_loader:
+                token_ids, masks, labels = tuple(data.to(device) for data in data_batch)
 
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss
-                total_loss += loss.item()
+                model_outputs = model(input_ids=token_ids, attention_mask=masks, labels=labels)
+                loss_value = model_outputs.loss
+                epoch_loss += loss_value.item()
 
-                loss.backward()
+                loss_value.backward()
                 optimizer.step()
-                scheduler.step()
+                learning_scheduler.step()
                 optimizer.zero_grad()
 
-            avg_loss = total_loss / len(train_dataloader)
-            logger.info(f"Epoch {epoch + 1}: Average Loss = {avg_loss}")
+            log_manager.info(f"Epoch {epoch + 1} completed with average loss: {epoch_loss / len(train_loader):.4f}")
 
-        if not os.path.exists(args.output_dir):
-            os.makedirs(args.output_dir)
-        model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
+        # Save Model
+        os.makedirs(arguments.output_directory, exist_ok=True)
+        model.save_pretrained(arguments.output_directory)
+        tokenizer.save_pretrained(arguments.output_directory)
 
-    if args.do_eval:
-        # Validation Evaluation
-        logger.info("Starting Validation evaluation...")
-        eval_examples = processor.get_eval_examples(args.data_dir)
-        eval_features = convert_examples_to_features(eval_examples, tokenizer, args.max_seq_length)
+    # Evaluation Phase
+    if arguments.evaluate_model:
+        validation_samples = processor.load_validation_data(arguments.data_directory)
+        validation_features = convert_samples_to_features(validation_samples, tokenizer, arguments.max_token_length)
 
-        eval_data = TensorDataset(
-            torch.stack([f.input_ids for f in eval_features]),
-            torch.stack([f.attention_mask for f in eval_features]),
-            torch.tensor([f.label_id for f in eval_features], dtype=torch.long),
+        validation_dataset = TensorDataset(
+            torch.stack([feature.token_ids for feature in validation_features]),
+            torch.stack([feature.attention_mask for feature in validation_features]),
+            torch.tensor([feature.label_index for feature in validation_features], dtype=torch.long),
         )
-        eval_sampler = SequentialSampler(eval_data)
-        eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.train_batch_size)
+        validation_loader = DataLoader(validation_dataset, sampler=SequentialSampler(validation_dataset), batch_size=arguments.batch_size)
 
-        evaluate_and_plot_roc(model, eval_dataloader, device, output_path="validation_roc_curve.png")
-        logger.info("Validation evaluation complete.")
-
-        # Test Evaluation
-        logger.info("Starting Test evaluation...")
-        test_examples = processor.get_test_examples(args.data_dir)
-        test_features = convert_examples_to_features(test_examples, tokenizer, args.max_seq_length)
-
-        test_data = TensorDataset(
-            torch.stack([f.input_ids for f in test_features]),
-            torch.stack([f.attention_mask for f in test_features]),
-            torch.tensor([f.label_id for f in test_features], dtype=torch.long),
+        roc_auc, metrics, accuracy = generate_roc_curve_and_metrics(
+            model, validation_loader, device, output_file="validation_roc_curve.png"
         )
-        test_sampler = SequentialSampler(test_data)
-        test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=args.train_batch_size)
-
-        test_roc_auc = evaluate_and_plot_roc(model, test_dataloader, device, output_path="test_roc_curve.png")
-        logger.info(f"Test ROC AUC: {test_roc_auc:.4f}")
-
-if __name__ == "__main__":
-    main()
-'''
-
-import os
-import logging
-import argparse
-import random
-import pandas as pd
-import numpy as np
-import torch
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
-from transformers import BertTokenizer, BertForSequenceClassification, get_scheduler
-from sklearn.metrics import classification_report, roc_auc_score, roc_curve, auc
-from torch.optim import AdamW
-from tqdm import trange
-import matplotlib.pyplot as plt
-
-# Set up logging
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-    datefmt="%m/%d/%Y %H:%M:%S",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
-# Processor Classes
-class InputExample:
-    def __init__(self, guid, text_a, text_b=None, label=None):
-        self.guid = guid
-        self.text_a = text_a
-        self.text_b = text_b
-        self.label = label
-
-class InputFeatures:
-    def __init__(self, input_ids, attention_mask, label_id):
-        self.input_ids = input_ids
-        self.attention_mask = attention_mask
-        self.label_id = label_id
-
-class DataProcessor:
-    @classmethod
-    def _read_csv(cls, input_file):
-        file = pd.read_csv(input_file)
-        required_columns = ["ID", "TEXT", "Label"]
-        if not all(col in file.columns for col in required_columns):
-            raise ValueError(f"The CSV file {input_file} must contain the following columns: {required_columns}")
-        return zip(file.ID, file.TEXT, file.Label)
-
-class ReadmissionProcessor(DataProcessor):
-    def get_train_examples(self, data_dir):
-        logger.info(f"LOOKING AT {os.path.join(data_dir, 'train.csv')}")
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "train.csv")), "train")
-
-    def get_eval_examples(self, data_dir):
-        logger.info(f"LOOKING AT {os.path.join(data_dir, 'val.csv')}")
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "val.csv")), "eval")
-
-    def get_test_examples(self, data_dir):
-        logger.info(f"LOOKING AT {os.path.join(data_dir, 'test.csv')}")
-        return self._create_examples(self._read_csv(os.path.join(data_dir, "test.csv")), "test")
-
-    def get_labels(self):
-        return ["0", "1"]
-
-    def _create_examples(self, lines, set_type):
-        examples = []
-        for i, line in enumerate(lines):
-            guid = f"{set_type}-{i}"
-            text_a = line[1]
-            label = int(line[2])
-            examples.append(InputExample(guid=guid, text_a=text_a, label=label))
-        return examples
-
-# Convert Examples to Features
-def convert_examples_to_features(examples, tokenizer, max_seq_length):
-    features = []
-    for example in examples:
-        inputs = tokenizer(
-            example.text_a,
-            padding="max_length",
-            truncation=True,
-            max_length=max_seq_length,
-            return_tensors="pt",
-        )
-        input_ids = inputs["input_ids"].squeeze(0)
-        attention_mask = inputs["attention_mask"].squeeze(0)
-        label_id = int(example.label)
-
-        features.append(InputFeatures(input_ids=input_ids, attention_mask=attention_mask, label_id=label_id))
-    return features
-
-# Evaluate Model and Plot ROC AUC
-def evaluate_and_plot_roc(model, dataloader, device, output_path):
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-
-    with torch.no_grad():
-        for batch in dataloader:
-            input_ids, attention_mask, labels = [b.to(device) for b in batch]
-
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            probs = torch.softmax(logits, dim=1)[:, 1]  # Positive class probability
-
-            preds = torch.argmax(logits, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-
-    # ROC Curve
-    fpr, tpr, _ = roc_curve(all_labels, all_probs)
-    roc_auc = auc(fpr, tpr)
-
-    # Plot ROC Curve
-    plt.figure()
-    plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {roc_auc:.2f})")
-    plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--", label="Chance")
-    plt.xlabel("False Positive Rate")
-    plt.ylabel("True Positive Rate")
-    plt.title("Receiver Operating Characteristic (ROC)")
-    plt.legend(loc="lower right")
-    plt.grid(True)
-    plt.savefig(output_path)
-    plt.close()
-
-    # Classification Report and Accuracy
-    report = classification_report(all_labels, all_preds, target_names=["Not Readmitted", "Readmitted"])
-    accuracy = np.mean(np.array(all_preds) == np.array(all_labels))
-
-    return roc_auc, report, accuracy
-
-# Main Function
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", required=True)
-    parser.add_argument("--bert_model", default="emilyalsentzer/Bio_ClinicalBERT", required=False)
-    parser.add_argument("--output_dir", required=True)
-    parser.add_argument("--max_seq_length", default=256, type=int)
-    parser.add_argument("--train_batch_size", default=16, type=int)
-    parser.add_argument("--learning_rate", default=1e-5, type=float)
-    parser.add_argument("--num_train_epochs", default=10, type=int)
-    parser.add_argument("--do_train", action="store_true")
-    parser.add_argument("--do_eval", action="store_true")
-    args = parser.parse_args()
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-
-    random.seed(42)
-    np.random.seed(42)
-    torch.manual_seed(42)
-    if device == "cuda":
-        torch.cuda.manual_seed_all(42)
-
-    processor = ReadmissionProcessor()
-    tokenizer = BertTokenizer.from_pretrained(args.bert_model)
-    model = BertForSequenceClassification.from_pretrained(args.bert_model, num_labels=2)
-    model.to(device)
-
-    if args.do_train:
-        train_examples = processor.get_train_examples(args.data_dir)
-        train_features = convert_examples_to_features(train_examples, tokenizer, args.max_seq_length)
-
-        train_data = TensorDataset(
-            torch.stack([f.input_ids for f in train_features]),
-            torch.stack([f.attention_mask for f in train_features]),
-            torch.tensor([f.label_id for f in train_features], dtype=torch.long),
-        )
-        train_sampler = RandomSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
-
-        optimizer = AdamW(model.parameters(), lr=args.learning_rate)
-        num_training_steps = len(train_dataloader) * args.num_train_epochs
-        scheduler = get_scheduler(
-            "linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
-        )
-
-        model.train()
-        for epoch in trange(args.num_train_epochs, desc="Epoch"):
-            total_loss = 0
-            for batch in train_dataloader:
-                batch = tuple(t.to(device) for t in batch)
-                input_ids, attention_mask, labels = batch
-
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss
-                total_loss += loss.item()
-
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-            avg_loss = total_loss / len(train_dataloader)
-            logger.info(f"Epoch {epoch + 1}: Average Loss = {avg_loss}")
-
-        if not os.path.exists(args.output_dir):
-            os.makedirs(args.output_dir)
-        model.save_pretrained(args.output_dir)
-        tokenizer.save_pretrained(args.output_dir)
-
-    if args.do_eval:
-        # Validation Evaluation
-        logger.info("Starting Validation evaluation...")
-        eval_examples = processor.get_eval_examples(args.data_dir)
-        eval_features = convert_examples_to_features(eval_examples, tokenizer, args.max_seq_length)
-
-        eval_data = TensorDataset(
-            torch.stack([f.input_ids for f in eval_features]),
-            torch.stack([f.attention_mask for f in eval_features]),
-            torch.tensor([f.label_id for f in eval_features], dtype=torch.long),
-        )
-        eval_sampler = SequentialSampler(eval_data)
-        eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=args.train_batch_size)
-
-        evaluate_and_plot_roc(model, eval_dataloader, device, output_path="validation_roc_curve.png")
-        logger.info("Validation evaluation complete.")
-
-        # Test Evaluation
-        logger.info("Starting Test evaluation...")
-        test_examples = processor.get_test_examples(args.data_dir)
-        test_features = convert_examples_to_features(test_examples, tokenizer, args.max_seq_length)
-
-        test_data = TensorDataset(
-            torch.stack([f.input_ids for f in test_features]),
-            torch.stack([f.attention_mask for f in test_features]),
-            torch.tensor([f.label_id for f in test_features], dtype=torch.long),
-        )
-        test_sampler = SequentialSampler(test_data)
-        test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=args.train_batch_size)
-
-        test_roc_auc, test_report, test_accuracy = evaluate_and_plot_roc(
-            model, test_dataloader, device, output_path="test_roc_curve.png"
-        )
-        logger.info(f"Test ROC AUC: {test_roc_auc:.4f}")
-        logger.info(f"Test Accuracy: {test_accuracy:.4f}")
-        logger.info("Test Classification Report:\n" + test_report)
+        log_manager.info(f"Validation AUC: {roc_auc:.4f}")
+        log_manager.info(f"Validation Metrics:\n{metrics}")
+        log_manager.info(f"Validation Accuracy: {accuracy:.4f}")
 
 if __name__ == "__main__":
     main()
